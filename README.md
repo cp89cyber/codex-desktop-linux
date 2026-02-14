@@ -17,12 +17,14 @@ The installer:
 
 ## Prerequisites
 
-**Node.js 20+**, **npm**, **Python 3**, **7z**, **curl**, and **build tools** (gcc/g++/make).
+**Node.js 20+**, **npm**, **Python 3**, **7z/7zz**, **curl**, and **build tools** (gcc/g++/make).
+
+Note: recent Codex DMGs require a modern 7-Zip (version 22+). If your system `7z` is too old, the installer will try to fetch a bundled `7zz` binary via npm (`7zip-bin-full`).
 
 ### Debian/Ubuntu
 
 ```bash
-sudo apt install nodejs npm python3 p7zip-full curl build-essential
+sudo apt install nodejs npm python3 7zip curl build-essential
 ```
 
 ### Fedora
@@ -99,7 +101,9 @@ A small Python HTTP server is used as a workaround: when `app.isPackaged` is `fa
 | Problem | Solution |
 |---------|----------|
 | `Error: write EPIPE` | Make sure you're not piping the output — run `start.sh` directly |
+| `error while loading shared libraries: libnspr4.so` (or `libnss3.so`) | Install Electron runtime libs: `sudo apt install libnspr4 libnss3` (Debian/Ubuntu), `sudo dnf install nspr nss` (Fedora/RHEL), `sudo pacman -S nspr nss` (Arch) |
 | Blank window | Check that port 5175 is not in use: `lsof -i :5175` |
+| Menu appears see-through on Linux | Quick-fix existing install: `./install.sh --patch-installed` (or `./install.sh --patch-installed /path/to/codex-app`). New installs via `./install.sh` include this fix by default. |
 | `CODEX_CLI_PATH` error | Install CLI: `npm i -g @openai/codex` |
 | GPU/rendering issues | Try: `./codex-app/start.sh --disable-gpu` |
 | Sandbox errors | The `--no-sandbox` flag is already set in `start.sh` |

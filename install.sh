@@ -27,16 +27,67 @@ cleanup() {
 trap cleanup EXIT
 trap 'error "Failed at line $LINENO (exit code $?)"' ERR
 
+# ---- Utilities ----
+is_valid_dmg() {
+    local dmg_path="$1"
+    [ -s "$dmg_path" ] || return 1
+    # UDIF DMGs store the "koly" signature in the trailer.
+    tail -c 2048 "$dmg_path" | grep -qa "koly"
+}
+
+get_7z_major_version() {
+    local seven_zip_bin="$1"
+    local line version
+    line="$("$seven_zip_bin" i 2>/dev/null | sed -n '/[0-9][0-9]*\.[0-9][0-9]*/{p;q}' || true)"
+    version=$(echo "$line" | grep -Eo '[0-9]{2,}\.[0-9]+' | head -n 1 || true)
+    version="${version:-0.0}"
+    echo "${version%%.*}"
+}
+
+resolve_7z_extractor() {
+    if command -v 7zz &>/dev/null; then
+        echo "$(command -v 7zz)"
+        return
+    fi
+
+    if command -v 7z &>/dev/null; then
+        local major
+        major=$(get_7z_major_version 7z)
+        if [ "$major" -ge 22 ]; then
+            echo "$(command -v 7z)"
+            return
+        fi
+
+        warn "Detected legacy 7z (major version: $major). Modern Codex DMGs need 7-Zip 22+."
+    fi
+
+    local seven_zip_dir="$WORK_DIR/7zip-bin"
+    mkdir -p "$seven_zip_dir"
+    info "Installing modern 7-Zip (7zz) via npm package 7zip-bin-full..."
+
+    npm --prefix "$seven_zip_dir" install --no-save --silent 7zip-bin-full >&2 || \
+        error "Could not install 7zip-bin-full. Install package '7zip' (provides 7zz) and retry."
+
+    local bundled_7z
+    bundled_7z=$(NODE_PATH="$seven_zip_dir/node_modules" node -e "process.stdout.write(require('7zip-bin-full').path7z)" 2>/dev/null || true)
+    [ -x "$bundled_7z" ] || error "Bundled 7-Zip binary not found. Install package '7zip' and retry."
+
+    echo "$bundled_7z"
+}
+
 # ---- Check dependencies ----
 check_deps() {
     local missing=()
-    for cmd in node npm npx python3 7z curl unzip; do
+    for cmd in node npm npx python3 curl unzip; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
+    if ! command -v 7z &>/dev/null && ! command -v 7zz &>/dev/null; then
+        missing+=("7z/7zz")
+    fi
     if [ ${#missing[@]} -ne 0 ]; then
         error "Missing dependencies: ${missing[*]}
 Install them first:
-  sudo apt install nodejs npm python3 p7zip-full curl unzip build-essential  # Debian/Ubuntu
+  sudo apt install nodejs npm python3 7zip curl unzip build-essential  # Debian/Ubuntu
   sudo dnf install nodejs npm python3 p7zip curl unzip && sudo dnf groupinstall 'Development Tools'  # Fedora
   sudo pacman -S nodejs npm python p7zip curl unzip base-devel  # Arch"
     fi
@@ -56,15 +107,35 @@ Install them first:
     info "All dependencies found"
 }
 
+check_patch_deps() {
+    local missing=()
+    for cmd in node npm npx; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [ ${#missing[@]} -ne 0 ]; then
+        error "Missing dependencies for --patch-installed: ${missing[*]}"
+    fi
+
+    local node_major
+    node_major=$(node -v | cut -d. -f1 | tr -d v)
+    if [ "$node_major" -lt 20 ]; then
+        error "Node.js 20+ required (found $(node -v))"
+    fi
+}
+
 # ---- Download or find Codex DMG ----
 get_dmg() {
     local dmg_dest="$SCRIPT_DIR/Codex.dmg"
 
     # Reuse existing DMG
     if [ -s "$dmg_dest" ]; then
-        info "Using cached DMG: $dmg_dest ($(du -h "$dmg_dest" | cut -f1))"
-        echo "$dmg_dest"
-        return
+        if is_valid_dmg "$dmg_dest"; then
+            info "Using cached DMG: $dmg_dest ($(du -h "$dmg_dest" | cut -f1))"
+            echo "$dmg_dest"
+            return
+        fi
+        warn "Cached file is not a valid DMG trailer signature. Re-downloading: $dmg_dest"
+        rm -f "$dmg_dest"
     fi
 
     info "Downloading Codex Desktop DMG..."
@@ -82,6 +153,11 @@ get_dmg() {
         error "Download produced empty file. Download manually and place as: $dmg_dest"
     fi
 
+    if ! is_valid_dmg "$dmg_dest"; then
+        rm -f "$dmg_dest"
+        error "Downloaded file is not a valid DMG. Download manually and place as: $dmg_dest"
+    fi
+
     info "Saved: $dmg_dest ($(du -h "$dmg_dest" | cut -f1))"
     echo "$dmg_dest"
 }
@@ -89,10 +165,13 @@ get_dmg() {
 # ---- Extract app from DMG ----
 extract_dmg() {
     local dmg_path="$1"
-    info "Extracting DMG with 7z..."
+    local seven_zip_bin
+    seven_zip_bin="$(resolve_7z_extractor)"
+    info "Extracting DMG with $(basename "$seven_zip_bin")..."
 
-    7z x -y "$dmg_path" -o"$WORK_DIR/dmg-extract" >&2 || \
-        error "Failed to extract DMG"
+    rm -rf "$WORK_DIR/dmg-extract"
+    "$seven_zip_bin" x -y "$dmg_path" -o"$WORK_DIR/dmg-extract" >&2 || \
+        error "Failed to extract DMG. Install modern 7-Zip (7zz, version 22+) and retry."
 
     local app_dir
     app_dir=$(find "$WORK_DIR/dmg-extract" -maxdepth 3 -name "*.app" -type d | head -1)
@@ -139,6 +218,47 @@ build_native_modules() {
     cp -r "$build_dir/node_modules/node-pty" "$app_extracted/node_modules/"
 }
 
+# ---- Patch transparent window background in Electron main bundle ----
+patch_window_background_opacity() {
+    local asar_extracted="$1"
+    local build_dir="$asar_extracted/.vite/build"
+    local bundle_path
+    local transparent_before
+    local patched_before
+    local transparent_after
+    local patched_after
+    local old_expr='="#00000000"'
+    local new_expr='=process.platform==="linux"?"#f2f2f2":"#00000000"'
+
+    [ -d "$build_dir" ] || error "Main process build directory not found: $build_dir"
+
+    bundle_path=$(find "$build_dir" -maxdepth 1 -type f -name 'main-*.js' | head -n 1)
+    [ -n "$bundle_path" ] || error "Could not find main-*.js bundle in $build_dir"
+
+    patched_before=$( (grep -F -o "$new_expr" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+    if [ "$patched_before" -eq 1 ]; then
+        info "Window opacity patch already present in $(basename "$bundle_path")"
+        return
+    fi
+    [ "$patched_before" -eq 0 ] || error "Window opacity patch mismatch in $(basename "$bundle_path"): expected 0/1 patched matches, got $patched_before"
+
+    transparent_before=$( (grep -F -o "$old_expr" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+    [ "$transparent_before" -eq 1 ] || error "Window transparency pattern mismatch in $(basename "$bundle_path"): expected 1 match, got $transparent_before"
+
+    info "Applying window opacity patch to $(basename "$bundle_path")..."
+    perl -0777 -i -pe \
+        's/=\"#00000000\"/=process.platform==="linux"?"#f2f2f2":"#00000000"/g' \
+        "$bundle_path"
+
+    patched_after=$( (grep -F -o "$new_expr" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+    transparent_after=$( (grep -F -o "$old_expr" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+
+    [ "$patched_after" -eq 1 ] || error "Window opacity patch validation failed in $(basename "$bundle_path"): expected 1 patched match, got $patched_after"
+    [ "$transparent_after" -eq 0 ] || error "Window opacity patch validation failed in $(basename "$bundle_path"): expected 0 legacy matches, got $transparent_after"
+
+    info "Window opacity patch applied"
+}
+
 # ---- Extract and patch app.asar ----
 patch_asar() {
     local app_dir="$1"
@@ -161,6 +281,7 @@ patch_asar() {
 
     # Build native modules in clean environment and copy back
     build_native_modules "$WORK_DIR/app-extracted"
+    patch_window_background_opacity "$WORK_DIR/app-extracted"
 
     # Repack
     info "Repacking app.asar..."
@@ -168,6 +289,93 @@ patch_asar() {
     npx asar pack app-extracted app.asar --unpack "{*.node,*.so,*.dylib}" 2>/dev/null
 
     info "app.asar patched"
+}
+
+# ---- Patch existing installed app in place ----
+patch_installed_app() {
+    local target_install_dir="$1"
+    local resolved_install_dir
+    local resources_dir
+    local app_asar
+    local extract_dir
+    local repacked_asar
+    local repacked_unpacked
+    local backup_path
+    local ts
+
+    resolved_install_dir=$(realpath "$target_install_dir" 2>/dev/null || true)
+    [ -n "$resolved_install_dir" ] || error "Install directory not found: $target_install_dir"
+
+    resources_dir="$resolved_install_dir/resources"
+    app_asar="$resources_dir/app.asar"
+    [ -f "$app_asar" ] || error "app.asar not found in $resources_dir"
+
+    info "Patching installed app in: $resolved_install_dir"
+
+    extract_dir="$WORK_DIR/app-extracted-installed"
+    repacked_asar="$WORK_DIR/app.asar.patched"
+    repacked_unpacked="$repacked_asar.unpacked"
+
+    npx --yes asar extract "$app_asar" "$extract_dir"
+    patch_window_background_opacity "$extract_dir"
+
+    info "Repacking patched app.asar..."
+    cd "$WORK_DIR"
+    npx asar pack "$extract_dir" "$repacked_asar" --unpack "{*.node,*.so,*.dylib}" 2>/dev/null
+
+    ts=$(date +%Y%m%d-%H%M%S)
+    backup_path="$resources_dir/app.asar.bak.$ts"
+    cp "$app_asar" "$backup_path"
+    cp "$repacked_asar" "$app_asar"
+
+    if [ -d "$repacked_unpacked" ]; then
+        rm -rf "$resources_dir/app.asar.unpacked"
+        cp -r "$repacked_unpacked" "$resources_dir/app.asar.unpacked"
+    fi
+
+    info "Backup created: $backup_path"
+    info "Installed app patched successfully"
+}
+
+# ---- Patch sidebar width behavior in webview bundle ----
+patch_sidebar_width_clamp() {
+    local asar_extracted="$WORK_DIR/app-extracted"
+    local assets_dir="$asar_extracted/webview/assets"
+    local bundle_path
+    local constants_before
+    local clamp_before
+    local constants_after
+    local clamp_after
+    local old_constants='const XJ=300,HCe=240,UCe=520,u5t=320,d5t=bo("sidebar-width",XJ);'
+    local new_constants='const XJ=280,HCe=220,UCe=420,u5t=560,d5t=bo("sidebar-width",XJ);'
+    local old_clamp='clamp(${HCe}px, ${e}px, min(${UCe}px, calc(100vw - ${u5t}px)))'
+    local new_clamp='clamp(${HCe}px, ${e}px, min(${UCe}px, 38vw, calc(100vw - ${u5t}px)))'
+
+    [ -d "$assets_dir" ] || error "Webview assets directory not found: $assets_dir"
+
+    bundle_path=$(grep -R -l 'bo("sidebar-width"' "$assets_dir" 2>/dev/null | head -n 1 || true)
+    [ -n "$bundle_path" ] || error "Could not find webview sidebar bundle to patch"
+
+    constants_before=$( (grep -F -o "$old_constants" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+    clamp_before=$( (grep -F -o "$old_clamp" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+
+    [ "$constants_before" -eq 1 ] || error "Sidebar constants pattern mismatch in $(basename "$bundle_path"): expected 1 match, got $constants_before"
+    [ "$clamp_before" -eq 1 ] || error "Sidebar clamp pattern mismatch in $(basename "$bundle_path"): expected 1 match, got $clamp_before"
+
+    info "Applying sidebar width clamp patch to $(basename "$bundle_path")..."
+
+    perl -0777 -i -pe \
+        's/const XJ=300,HCe=240,UCe=520,u5t=320,d5t=bo\("sidebar-width",XJ\);/const XJ=280,HCe=220,UCe=420,u5t=560,d5t=bo("sidebar-width",XJ);/g;
+         s/clamp\(\$\{HCe\}px, \$\{e\}px, min\(\$\{UCe\}px, calc\(100vw - \$\{u5t\}px\)\)\)/clamp(\${HCe}px, \${e}px, min(\${UCe}px, 38vw, calc(100vw - \${u5t}px)))/g' \
+        "$bundle_path"
+
+    constants_after=$( (grep -F -o "$new_constants" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+    clamp_after=$( (grep -F -o "$new_clamp" "$bundle_path" || true) | wc -l | tr -d '[:space:]')
+
+    [ "$constants_after" -eq 1 ] || error "Sidebar constants patch validation failed in $(basename "$bundle_path"): expected 1 updated match, got $constants_after"
+    [ "$clamp_after" -eq 1 ] || error "Sidebar clamp patch validation failed in $(basename "$bundle_path"): expected 1 updated match, got $clamp_after"
+
+    info "Sidebar width clamp patch applied"
 }
 
 # ---- Download Linux Electron ----
@@ -222,6 +430,44 @@ create_start_script() {
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WEBVIEW_DIR="$SCRIPT_DIR/content/webview"
+ELECTRON_BIN="$SCRIPT_DIR/electron"
+
+check_electron_runtime_libs() {
+    local missing_libs=()
+    local os_id=""
+
+    mapfile -t missing_libs < <(ldd "$ELECTRON_BIN" 2>/dev/null | awk '/not found/ {print $1}')
+    if [ "${#missing_libs[@]}" -eq 0 ]; then
+        return
+    fi
+
+    echo "Error: Missing shared libraries required by Electron:"
+    for lib in "${missing_libs[@]}"; do
+        echo "  - $lib"
+    done
+
+    if [ -r /etc/os-release ]; then
+        os_id="$(. /etc/os-release; echo "${ID:-}")"
+    fi
+
+    case "$os_id" in
+        debian|ubuntu|linuxmint|pop|zorin|elementary)
+            echo "Install with: sudo apt install libnspr4 libnss3"
+            ;;
+        fedora|rhel|centos|rocky|almalinux)
+            echo "Install with: sudo dnf install nspr nss"
+            ;;
+        arch|manjaro|endeavouros)
+            echo "Install with: sudo pacman -S nspr nss"
+            ;;
+        *)
+            echo "Install distro packages that provide the missing libraries above."
+            ;;
+    esac
+    exit 1
+}
+
+check_electron_runtime_libs
 
 pkill -f "http.server 5175" 2>/dev/null
 sleep 0.3
@@ -241,7 +487,7 @@ if [ -z "$CODEX_CLI_PATH" ]; then
 fi
 
 cd "$SCRIPT_DIR"
-exec "$SCRIPT_DIR/electron" --no-sandbox "$@"
+exec "$ELECTRON_BIN" --no-sandbox "$@"
 SCRIPT
 
     chmod +x "$INSTALL_DIR/start.sh"
@@ -254,6 +500,14 @@ main() {
     echo "  Codex Desktop for Linux — Installer"       >&2
     echo "============================================" >&2
     echo ""                                             >&2
+
+    if [ $# -ge 1 ] && [ "$1" = "--patch-installed" ]; then
+        local patch_target="${2:-$INSTALL_DIR}"
+        [ $# -le 2 ] || error "Usage: ./install.sh --patch-installed [install_dir]"
+        check_patch_deps
+        patch_installed_app "$patch_target"
+        return
+    fi
 
     check_deps
 
@@ -269,6 +523,7 @@ main() {
     app_dir=$(extract_dmg "$dmg_path")
 
     patch_asar "$app_dir"
+    patch_sidebar_width_clamp
     download_electron
     extract_webview "$app_dir"
     install_app
