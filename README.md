@@ -1,54 +1,49 @@
-# Codex Desktop for Linux
+# Atlas Desktop for Linux
 
-Run [OpenAI Codex Desktop](https://openai.com/codex/) on Linux.
+Run Atlas on Linux using an Atlas DMG input and a Linux Electron wrapper.
 
-The official Codex Desktop app is macOS-only. This project provides an automated installer that converts the macOS `.dmg` into a working Linux application.
+## What this installer does
 
-## How it works
+The installer accepts Atlas DMGs and produces a runnable Linux app wrapper in `atlas-app/` (by default).
 
-The installer:
+Supported inputs:
 
-1. Extracts the macOS `.dmg` (using `7z`)
-2. Extracts `app.asar` (the Electron app bundle)
-3. Rebuilds native Node.js modules (`node-pty`, `better-sqlite3`) for Linux
-4. Removes macOS-only modules (`sparkle` auto-updater)
-5. Downloads Linux Electron (same version as the app — v40)
-6. Repacks everything and creates a launch script
+- Atlas installer DMG (`Install_ChatGPT_Atlas.dmg`)
+- Atlas payload DMG (`ChatGPT_Atlas.dmg`)
+
+Unsupported inputs:
+
+- DMGs containing `Contents/Resources/app.asar` (explicitly rejected)
 
 ## Prerequisites
 
-**Node.js 20+**, **npm**, **Python 3**, **7z/7zz**, **curl**, and **build tools** (gcc/g++/make).
-
-Note: recent Codex DMGs require a modern 7-Zip (version 22+). If your system `7z` is too old, the installer will try to fetch a bundled `7zz` binary via npm (`7zip-bin-full`).
+- Node.js 20+
+- npm
+- 7z or 7zz (installer can bootstrap modern `7zz` via `7zip-bin-full`)
+- curl
+- unzip
 
 ### Debian/Ubuntu
 
 ```bash
-sudo apt install nodejs npm python3 7zip curl build-essential
+sudo apt install nodejs npm 7zip curl unzip
 ```
 
 ### Fedora
 
 ```bash
-sudo dnf install nodejs npm python3 p7zip curl
-sudo dnf groupinstall 'Development Tools'
+sudo dnf install nodejs npm p7zip curl unzip
 ```
 
 ### Arch
 
 ```bash
-sudo pacman -S nodejs npm python p7zip curl base-devel
-```
-
-You also need the **Codex CLI**:
-
-```bash
-npm i -g @openai/codex
+sudo pacman -S nodejs npm p7zip curl unzip
 ```
 
 ## Installation
 
-### Option A: Auto-download DMG
+### Option A: Auto-download default Atlas installer DMG
 
 ```bash
 git clone https://github.com/ilysenko/codex-desktop-linux.git
@@ -57,60 +52,61 @@ chmod +x install.sh
 ./install.sh
 ```
 
-### Option B: Provide your own DMG
-
-Download `Codex.dmg` from [openai.com/codex](https://openai.com/codex/), then:
+### Option B: Provide your own Atlas DMG
 
 ```bash
-./install.sh /path/to/Codex.dmg
+./install.sh /path/to/Install_ChatGPT_Atlas.dmg
+# or
+./install.sh /path/to/ChatGPT_Atlas.dmg
 ```
 
-## Usage
+## Install location
 
-The app is installed into `codex-app/` next to the install script:
+Install directory precedence:
+
+1. `ATLAS_INSTALL_DIR`
+2. `CODEX_INSTALL_DIR` (deprecated fallback; installer prints warning)
+3. Default: `./atlas-app`
+
+Examples:
 
 ```bash
-codex-desktop-linux/codex-app/start.sh
+ATLAS_INSTALL_DIR=/opt/atlas ./install.sh /path/to/Install_ChatGPT_Atlas.dmg
 ```
-
-Or add an alias to your shell:
 
 ```bash
-echo 'alias codex-desktop="~/codex-desktop-linux/codex-app/start.sh"' >> ~/.bashrc
+CODEX_INSTALL_DIR=/opt/atlas-legacy ./install.sh /path/to/Install_ChatGPT_Atlas.dmg
 ```
 
-### Custom install directory
+## Atlas start URL behavior
+
+Launch URL precedence:
+
+1. `ATLAS_START_URL` env var
+2. URL hint extracted from Atlas payload/installer
+3. Fallback: `https://chatgpt.com/atlas?get-started`
+
+Example override:
 
 ```bash
-CODEX_INSTALL_DIR=/opt/codex ./install.sh
+ATLAS_START_URL="https://example.test" ./atlas-app/start.sh
 ```
 
-## How it works (technical details)
+## Removed option
 
-The macOS Codex app is an Electron application. The core code (`app.asar`) is platform-independent JavaScript, but it bundles:
-
-- **Native modules** compiled for macOS (`node-pty` for terminal emulation, `better-sqlite3` for local storage, `sparkle` for auto-updates)
-- **Electron binary** for macOS
-
-The installer replaces the macOS Electron with a Linux build and recompiles the native modules using `@electron/rebuild`. The `sparkle` module (macOS-only auto-updater) is removed since it has no Linux equivalent.
-
-A small Python HTTP server is used as a workaround: when `app.isPackaged` is `false` (which happens with extracted builds), the app tries to connect to a Vite dev server on `localhost:5175`. The HTTP server serves the static webview files on that port.
+`--patch-installed` has been removed. It was specific to older non-Atlas conversion behavior.
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| `Error: write EPIPE` | Make sure you're not piping the output — run `start.sh` directly |
 | `error while loading shared libraries: libnspr4.so` (or `libnss3.so`) | Install Electron runtime libs: `sudo apt install libnspr4 libnss3` (Debian/Ubuntu), `sudo dnf install nspr nss` (Fedora/RHEL), `sudo pacman -S nspr nss` (Arch) |
-| Blank window | Check that port 5175 is not in use: `lsof -i :5175` |
-| Menu appears see-through on Linux | Quick-fix existing install: `./install.sh --patch-installed` (or `./install.sh --patch-installed /path/to/codex-app`). New installs via `./install.sh` include this fix by default. |
-| `CODEX_CLI_PATH` error | Install CLI: `npm i -g @openai/codex` |
-| GPU/rendering issues | Try: `./codex-app/start.sh --disable-gpu` |
-| Sandbox errors | The `--no-sandbox` flag is already set in `start.sh` |
+| Atlas DMG is rejected as unsupported | Verify you supplied an Atlas DMG. DMGs with `app.asar` are intentionally unsupported. |
+| Atlas app installs but does not launch | Run `./atlas-app/start.sh` directly and verify required runtime libraries are present. |
 
 ## Disclaimer
 
-This is an unofficial community project. Codex Desktop is a product of OpenAI. This tool does not redistribute any OpenAI software — it automates the conversion process that users perform on their own copies.
+This is an unofficial community project. Atlas is a product of OpenAI.
 
 ## License
 
