@@ -127,6 +127,44 @@ binary_contains() {
     grep -a -Fq "$needle" "$file_path" 2>/dev/null
 }
 
+find_local_payload_dmg() {
+    local explicit_payload_dmg="${ATLAS_PAYLOAD_DMG:-}"
+    local script_payload_dmg="$SCRIPT_DIR/ChatGPT_Atlas.dmg"
+    local cwd_payload_dmg="$PWD/ChatGPT_Atlas.dmg"
+    local canonical_script_payload=""
+    local canonical_cwd_payload=""
+
+    if [ -n "$explicit_payload_dmg" ]; then
+        [ -f "$explicit_payload_dmg" ] || error "ATLAS_PAYLOAD_DMG points to a missing file: $explicit_payload_dmg"
+        explicit_payload_dmg="$(realpath "$explicit_payload_dmg")"
+        is_valid_dmg "$explicit_payload_dmg" || error "ATLAS_PAYLOAD_DMG is not a valid DMG: $explicit_payload_dmg"
+        echo "$explicit_payload_dmg"
+        return
+    fi
+
+    if [ -f "$script_payload_dmg" ]; then
+        canonical_script_payload="$(realpath "$script_payload_dmg")"
+        if is_valid_dmg "$canonical_script_payload"; then
+            echo "$canonical_script_payload"
+            return
+        fi
+        warn "Ignoring invalid local payload DMG: $canonical_script_payload"
+    fi
+
+    if [ -f "$cwd_payload_dmg" ]; then
+        canonical_cwd_payload="$(realpath "$cwd_payload_dmg")"
+        if [ "$canonical_cwd_payload" != "$canonical_script_payload" ]; then
+            if is_valid_dmg "$canonical_cwd_payload"; then
+                echo "$canonical_cwd_payload"
+                return
+            fi
+            warn "Ignoring invalid local payload DMG: $canonical_cwd_payload"
+        fi
+    fi
+
+    return 1
+}
+
 is_codex_shape_app() {
     local app_dir="$1"
     [ -f "$app_dir/Contents/Resources/app.asar" ]
@@ -164,6 +202,26 @@ is_atlas_like_app() {
     return 1
 }
 
+is_atlas_installer_app() {
+    local app_dir="$1"
+    local main_bin
+    local sig
+
+    main_bin="$(app_main_binary_path "$app_dir")"
+    [ -f "$main_bin" ] || return 1
+
+    for sig in \
+        "Install_ChatGPT_Atlas.dmg" \
+        "/atlas/public/ChatGPT_Atlas.dmg" \
+        "InstallerAppIcon.icns"; do
+        if binary_contains "$main_bin" "$sig"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # ---- Dependency checks ----
 check_deps() {
     local missing=()
@@ -191,34 +249,42 @@ Install them first:
     info "All dependencies found"
 }
 
-# ---- Download or locate Atlas installer DMG ----
+# ---- Resolve local DMG or download installer fallback ----
 get_dmg() {
-    local dmg_dest="$SCRIPT_DIR/Install_ChatGPT_Atlas.dmg"
+    local local_payload_dmg=""
+    local installer_dmg="$SCRIPT_DIR/Install_ChatGPT_Atlas.dmg"
 
-    if [ -s "$dmg_dest" ]; then
-        if is_valid_dmg "$dmg_dest"; then
-            info "Using cached DMG: $dmg_dest ($(du -h "$dmg_dest" | cut -f1))"
-            echo "$dmg_dest"
-            return
-        fi
-        warn "Cached file is not a valid DMG. Re-downloading: $dmg_dest"
-        rm -f "$dmg_dest"
+    local_payload_dmg=$(find_local_payload_dmg || true)
+    if [ -n "$local_payload_dmg" ]; then
+        info "Using local Atlas payload DMG: $local_payload_dmg ($(du -h "$local_payload_dmg" | cut -f1))"
+        echo "$local_payload_dmg"
+        return
     fi
 
-    info "Downloading Atlas installer DMG..."
+    if [ -s "$installer_dmg" ]; then
+        if is_valid_dmg "$installer_dmg"; then
+            info "Using cached Atlas installer DMG: $installer_dmg ($(du -h "$installer_dmg" | cut -f1))"
+            echo "$installer_dmg"
+            return
+        fi
+        warn "Cached installer file is not a valid DMG. Re-downloading: $installer_dmg"
+        rm -f "$installer_dmg"
+    fi
+
+    info "No local Atlas DMG found; downloading Atlas installer DMG..."
     info "URL: $ATLAS_INSTALLER_URL_DEFAULT"
 
     if ! curl -L --progress-bar --max-time 600 --connect-timeout 30 \
-            -o "$dmg_dest" "$ATLAS_INSTALLER_URL_DEFAULT"; then
-        rm -f "$dmg_dest"
-        error "Download failed. Download manually and place as: $dmg_dest"
+            -o "$installer_dmg" "$ATLAS_INSTALLER_URL_DEFAULT"; then
+        rm -f "$installer_dmg"
+        error "Download failed. Download manually and place as: $installer_dmg"
     fi
 
-    [ -s "$dmg_dest" ] || error "Download produced empty file: $dmg_dest"
-    is_valid_dmg "$dmg_dest" || error "Downloaded file is not a valid DMG: $dmg_dest"
+    [ -s "$installer_dmg" ] || error "Download produced empty file: $installer_dmg"
+    is_valid_dmg "$installer_dmg" || error "Downloaded file is not a valid DMG: $installer_dmg"
 
-    info "Saved: $dmg_dest ($(du -h "$dmg_dest" | cut -f1))"
-    echo "$dmg_dest"
+    info "Saved installer DMG: $installer_dmg ($(du -h "$installer_dmg" | cut -f1))"
+    echo "$installer_dmg"
 }
 
 # ---- Extract app bundle from DMG ----
@@ -258,6 +324,7 @@ atlas_payload_url_from_installer() {
 
 resolve_atlas_payload_app() {
     local extracted_app_dir="$1"
+    local local_payload_dmg=""
     local payload_url
     local payload_dmg="$WORK_DIR/ChatGPT_Atlas.dmg"
     local atlas_app_dir
@@ -267,6 +334,7 @@ resolve_atlas_payload_app() {
     fi
 
     if [ -d "$extracted_app_dir/Contents/Support/ChatGPT Atlas.app" ]; then
+        info "Using Atlas payload app bundle from extracted DMG."
         echo "$extracted_app_dir"
         return
     fi
@@ -274,10 +342,31 @@ resolve_atlas_payload_app() {
     is_atlas_like_app "$extracted_app_dir" || \
         error "Unsupported DMG: no Atlas app signatures found."
 
+    if ! is_atlas_installer_app "$extracted_app_dir"; then
+        info "Using Atlas payload-like app bundle from extracted DMG."
+        echo "$extracted_app_dir"
+        return
+    fi
+
+    local_payload_dmg=$(find_local_payload_dmg || true)
+    if [ -n "$local_payload_dmg" ]; then
+        info "Atlas installer detected; using local payload DMG: $local_payload_dmg"
+        atlas_app_dir=$(extract_dmg_to "$local_payload_dmg" "$WORK_DIR/atlas-payload-extract-local")
+
+        if is_codex_shape_app "$atlas_app_dir"; then
+            error "Unsupported payload: detected app.asar (Codex-style package). This installer is Atlas-only."
+        fi
+
+        is_atlas_like_app "$atlas_app_dir" || error "Local Atlas payload DMG does not contain a compatible Atlas app bundle"
+
+        echo "$atlas_app_dir"
+        return
+    fi
+
     payload_url=$(atlas_payload_url_from_installer "$extracted_app_dir" || true)
     [ -n "$payload_url" ] || payload_url="$ATLAS_PAYLOAD_FALLBACK_URL"
 
-    info "Atlas installer detected; fetching payload DMG..."
+    info "Atlas installer detected; no local payload DMG found. Fetching payload DMG..."
     info "Payload URL: $payload_url"
 
     if ! curl -L --progress-bar --max-time 900 --connect-timeout 30 \
@@ -523,7 +612,7 @@ main() {
         error "The --patch-installed option was removed. It was Codex-only and is not available in this Atlas-only installer."
     fi
 
-    [ $# -le 1 ] || error "Usage: ./install.sh [Install_ChatGPT_Atlas.dmg]"
+    [ $# -le 1 ] || error "Usage: ./install.sh [Install_ChatGPT_Atlas.dmg|ChatGPT_Atlas.dmg]"
 
     check_deps
     resolve_install_dir

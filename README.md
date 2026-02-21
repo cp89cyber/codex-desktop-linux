@@ -43,7 +43,7 @@ sudo pacman -S nodejs npm p7zip curl unzip
 
 ## Installation
 
-### Option A: Auto-download default Atlas installer DMG
+### Option A: Auto-detect local DMGs (payload first), then download fallback
 
 ```bash
 git clone https://github.com/ilysenko/codex-desktop-linux.git
@@ -52,6 +52,14 @@ chmod +x install.sh
 ./install.sh
 ```
 
+When no DMG path is provided, source precedence is:
+
+1. `ATLAS_PAYLOAD_DMG` (must exist and be a valid DMG)
+2. `./ChatGPT_Atlas.dmg` next to `install.sh`
+3. `$PWD/ChatGPT_Atlas.dmg`
+4. `./Install_ChatGPT_Atlas.dmg` next to `install.sh`
+5. Download default installer DMG from `ATLAS_INSTALLER_URL_DEFAULT`
+
 ### Option B: Provide your own Atlas DMG
 
 ```bash
@@ -59,6 +67,21 @@ chmod +x install.sh
 # or
 ./install.sh /path/to/ChatGPT_Atlas.dmg
 ```
+
+### Optional payload override env var
+
+Set `ATLAS_PAYLOAD_DMG` to force a specific local payload DMG path.
+
+```bash
+ATLAS_PAYLOAD_DMG=/path/to/ChatGPT_Atlas.dmg ./install.sh
+```
+
+If input is an Atlas installer DMG, payload resolution precedence is:
+
+1. `ATLAS_PAYLOAD_DMG`
+2. `./ChatGPT_Atlas.dmg` next to `install.sh`
+3. `$PWD/ChatGPT_Atlas.dmg`
+4. Download payload DMG from installer-derived URL (fallback)
 
 ## Install location
 
